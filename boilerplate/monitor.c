@@ -11,6 +11,7 @@
  * YOUR WORK: Fill in all sections marked // TODO.
  */
 
+#include <asm-generic/errno-base.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/fs.h>
@@ -39,6 +40,15 @@
  *   - remember whether the soft-limit warning was already emitted
  *   - include `struct list_head` linkage
  * ============================================================== */
+struct monitored_entry {
+    pid_t pid;
+    char container_id[64];
+    unsigned long soft_limit_bytes;
+    unsigned long hard_limit_bytes;
+    int soft_limit_warned;  // 1 if the soft-limit warning was already emitted
+    struct list_head list;
+};
+
 
 
 /* ==============================================================
@@ -52,6 +62,8 @@
  * justify the choice in terms of the code paths you implemented.
  * ============================================================== */
 
+static LIST_HEAD(monitored_list);
+static DEFINE_MUTEX(monitored_lock);
 
 /* --- Provided: internal device / timer state --- */
 static struct timer_list monitor_timer;
@@ -144,6 +156,37 @@ static void timer_callback(struct timer_list *t)
      *   - avoid use-after-free while deleting during iteration
      * ============================================================== */
 
+    struct monitored_entry *entry, *temp;
+
+    mutex_lock(&monitored_lock);
+    list_for_each_entry_safe(entry, temp, &monitored_list, list) { 
+        long rss = get_rss_bytes(entry->pid); // what is actually in the physical memory right now
+
+        //process no longer exists -> remove stale entry
+        if(rss < 0) {
+            printk(KERN_INFO "[container_monitor] PID %d exited, removing the entry\n", entry->pid);
+            list_del(&entry->list);
+            kfree(entry);
+            continue;
+        }
+
+        //hard-limit - kill nand remove
+        if((unsigned long)rss >= entry->hard_limit_bytes) {
+            kill_process(entry->container_id, entry->pid, entry->hard_limit_bytes, rss);
+            list_del(&entry->list);
+            kfree(entry);
+            continue;
+        }
+
+        //soft-limit - warn once per entry
+        if((unsigned long)rss >= entry->soft_limit_bytes) {
+            log_soft_limit_event(entry->container_id, entry->pid, entry->soft_limit_bytes, rss);
+            entry->soft_limit_warned = 1;
+        }
+
+    }
+    mutex_unlock(&monitored_lock);
+
     mod_timer(&monitor_timer, jiffies + CHECK_INTERVAL_SEC * HZ);
 }
 
@@ -180,6 +223,33 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
          *   - insert into the shared list under the chosen lock
          * ============================================================== */
 
+        //validate limits
+        if(req.soft_limit_bytes > req.hard_limit_bytes) {
+            printk(KERN_WARNING "[container_monitor] Invalid limits: soft > hard");
+            return -EINVAL; //meaning "Invalid Argument" (value 22 in Linux). It occurs when a function or system call receives an invalid, unsupported, or out-of-range parameter,                                  such as null pointers, unsupported file flags
+        }
+
+        // allocate a new node
+        struct monitored_entry *entry = kmalloc(sizeof(struct monitored_entry), GFP_KERNEL);
+        if(!entry) {
+            printk(KERN_ERR "[container_monitor] kmalloc failed\n");
+            return -ENOMEM;
+        }
+
+        // filling all the fields of entry
+        
+        entry->pid = req.pid;
+        entry->soft_limit_bytes = req.soft_limit_bytes;
+        entry->hard_limit_bytes = req.hard_limit_bytes;
+        entry->soft_limit_warned = 0;
+        strncpy(entry->container_id, req.container_id, sizeof(entry->container_id) - 1);
+        entry->container_id[sizeof(entry->container_id) - 1] = '\0';
+
+        //insert into the shared list under lock
+        mutex_lock(&monitored_lock);
+        list_add(&entry->list, &monitored_list);
+        mutex_unlock(&monitored_lock);
+
         return 0;
     }
 
@@ -196,7 +266,23 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
      *   - return status indicating whether a matching entry was removed
      * ============================================================== */
 
-    return -ENOENT;
+    struct monitored_entry *entry, *temp;
+    int found = 0;
+    
+    mutex_lock(&monitored_lock);
+    list_for_each_entry_safe(entry, temp, &monitored_list, list) {  // macro : iterates through every node (its similar to for loop , defined in <linux/list.h>)
+        if(entry->pid == req.pid && strncmp(entry->container_id, req.container_id, sizeof(entry->container_id)) == 0) {
+            list_del(&entry->list); // removes node form the list, but does not free memory
+            kfree(entry);
+            found = 1;
+            break;
+        }
+    }
+    mutex_unlock(&monitored_lock);
+
+    if(!found) return -ENOENT;
+
+    return 0;
 }
 
 /* --- Provided: file operations --- */
@@ -245,7 +331,7 @@ static int __init monitor_init(void)
 /* --- Provided: Module Exit --- */
 static void __exit monitor_exit(void)
 {
-    del_timer_sync(&monitor_timer);
+    timer_delete_sync(&monitor_timer);
 
     /* ==============================================================
      * TODO 6: Free all remaining monitored entries.
@@ -254,6 +340,14 @@ static void __exit monitor_exit(void)
      *   - remove and free every list node safely
      *   - leave no leaked state on module unload
      * ============================================================== */
+
+    struct monitored_entry *entry, *temp;
+    mutex_lock(&monitored_lock);
+    list_for_each_entry_safe(entry, temp, &monitored_list, list) {
+        list_del(&entry->list);
+        kfree(entry);
+    }
+    mutex_unlock(&monitored_lock);
 
     cdev_del(&c_dev);
     device_destroy(cl, dev_num);
