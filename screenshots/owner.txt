@@ -1,0 +1,9 @@
+This project has been done by:  
+Name 1 : KARNATI UDAY KEERTHAN REDDY  
+SRN 1 : PES1UG24CS217  
+  
+Name 2 : SUMUKH KURADI KALKURA  
+SRN 2 : PES1UG24CS244  
+
+but the screenshots are from the device the program was run on.  
+to remove inconsistency we have used one device's screenshots in both the repos
